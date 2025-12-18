@@ -1,0 +1,44 @@
+source "https://rubygems.org"
+
+ruby "3.3.0"
+
+# Rails framework
+gem "rails", "~> 7.2.0"
+
+# Database - use SQLite for development, PostgreSQL for production
+gem "sqlite3", "~> 1.4"
+gem "pg", "~> 1.5", group: :production
+
+# Puma web server - configured for thread-safe operation
+# MCP SSE requires concurrent request handling
+gem "puma", ">= 6.4"
+
+# MCP Server implementation
+# fast-mcp provides ActionTool and ActionResource abstractions
+# SSE transport is built-in and thread-safe
+gem "fast-mcp"
+gem "fast-mcp-annotations"
+
+# CORS support for Remix frontend
+gem "rack-cors"
+
+# Environment variables management
+gem "dotenv-rails", groups: [:development, :test]
+
+# JSON serialization
+gem "oj" # Fast JSON parser
+
+# Boot time optimization
+gem "bootsnap", require: false
+
+group :development, :test do
+  gem "debug", platforms: %i[ mri mingw x64_mingw ]
+  gem "rspec-rails"
+  gem "factory_bot_rails"
+end
+
+group :development do
+  # Spring speeds up development by keeping your application running in the background
+  # Note: Careful with Spring and ActionController::Live - may need to disable
+  gem "spring"
+end

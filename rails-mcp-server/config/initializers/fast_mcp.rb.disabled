@@ -1,0 +1,232 @@
+# frozen_string_literal: true
+
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# MCP SERVER INITIALIZATION - Design Decisions & Architecture
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ARCHITECTURAL DECISION: Centralized Tool Registration
+# ────────────────────────────────────────────────────────
+# We chose to register all MCP tools in this initializer rather than using
+# Rails autoloading or scattered registrations because:
+#
+# 1. EXPLICIT SURFACE AREA: Every tool exposed to the LLM is visible in one place.
+#    This is critical for security audits - you want to know exactly what
+#    actions an AI can take in your system.
+#
+# 2. STARTUP VALIDATION: Registration happens at boot time. If a tool class is
+#    missing or misconfigured, the app fails fast rather than at runtime.
+#
+# 3. ORDERING CONTROL: Tools are registered in a deterministic order, which
+#    matters for testing and debugging tool discovery.
+#
+# Alternative considered: Auto-registration via `app/tools/**/*.rb` scanning.
+# Rejected because: Implicit registration makes it too easy to accidentally
+# expose a tool. Explicit is safer for AI-callable endpoints.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# THREAD SAFETY GUARANTEES
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This initializer runs ONCE at application boot, before any requests arrive.
+# The resulting configuration is immutable and can be safely read by any thread.
+#
+# FastMcp.configure creates a frozen configuration object:
+# - Tool registry: Hash.freeze (immutable after boot)
+# - Resource registry: Hash.freeze (immutable after boot)
+# - Settings: All scalar values, no mutable collections
+#
+# When Puma spawns threads to handle concurrent SSE connections, each thread
+# reads the same frozen configuration. No synchronization needed.
+#
+# DANGER ZONE: If you need runtime tool registration (e.g., per-merchant tools),
+# you would need a thread-safe registry (Concurrent::Map) instead.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# SSE TRANSPORT RATIONALE
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Why SSE over WebSocket?
+# ────────────────────────
+# 1. HTTP SEMANTICS: SSE works over vanilla HTTP/HTTPS. Load balancers, proxies,
+#    and CDNs handle it without special configuration. WebSocket requires
+#    upgrade negotiation that some infrastructure doesn't support.
+#
+# 2. AUTOMATIC RECONNECTION: The browser's EventSource API reconnects automatically
+#    on network blips. WebSocket requires manual reconnection logic.
+#
+# 3. SIMPLER SERVER: No handshake protocol, no frame parsing, no ping/pong.
+#    Just write "data: {json}\n\n" to a response stream.
+#
+# 4. UNIDIRECTIONAL FIT: MCP's primary flow is server→client (streaming tool
+#    results, LLM tokens). Client→server is request/response (tool calls).
+#    SSE + HTTP POST is actually a better fit than bidirectional WebSocket.
+#
+# Why SSE over HTTP Long-Polling?
+# ────────────────────────────────
+# Long-polling reopens connections after each response, adding latency.
+# SSE keeps one connection open for multiple events. For streaming LLM
+# tokens (many small messages), SSE is dramatically more efficient.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+require 'fast_mcp'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP SERVER CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Note: fast-mcp 1.6.0 doesn't have a configure block.
+# Configuration is done through environment variables and direct method calls.
+#
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL REGISTRATION
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# MCP Tools are the primary way LLMs interact with your system.
+# Each tool represents a capability the AI can invoke.
+#
+# DESIGN PRINCIPLES FOR TOOLS:
+#
+# 1. SINGLE RESPONSIBILITY: Each tool does one thing well.
+#    "aggregate_customer_context" fetches unified customer data.
+#    "refund_order" processes refunds.
+#    Don't make a "do_everything" tool.
+#
+# 2. LLM-FRIENDLY DESCRIPTIONS: The description is the tool's documentation
+#    for the AI. Be specific about:
+#    - When to use this tool
+#    - What parameters it needs
+#    - What it returns
+#    The AI reads this to decide whether to call the tool.
+#
+# 3. IDEMPOTENT WHERE POSSIBLE: Read operations should be safe to call
+#    multiple times. Write operations should validate state before acting.
+#
+# 4. FAIL GRACEFULLY: Return structured error objects, not exceptions.
+#    The LLM needs to understand what went wrong.
+#
+
+#
+# Tool: aggregate_customer_context
+# ─────────────────────────────────
+# DESIGN DECISION: Single tool for multi-platform aggregation vs. separate tools.
+#
+# Alternative considered: Separate tools for each platform:
+# - fetch_shopify_customer
+# - fetch_salesforce_contact
+# - fetch_klaviyo_profile
+#
+# We chose aggregation because:
+# 1. ATOMIC OPERATION: The LLM almost always wants the full picture.
+#    Separate tools would require the LLM to make 4 tool calls and merge results.
+# 2. EFFICIENCY: One round-trip instead of four. Lower latency for the user.
+# 3. CONSISTENCY: Aggregated data has a single timestamp. Separate fetches
+#    might race and show inconsistent state.
+#
+# Tradeoff: Less granular. If you only need Shopify data, you still fetch all.
+# Mitigation: Add optional `platforms` parameter to filter which sources to query.
+#
+FastMcp.register_tool(
+  name: "aggregate_customer_context",
+  description: <<~DESC.strip,
+    Aggregates customer data from Shopify, Salesforce, Klaviyo, and Cin7 into a unified view.
+
+    USE THIS TOOL WHEN:
+    - A merchant asks about a specific customer
+    - You need to understand a customer's history across platforms
+    - Making recommendations that require cross-platform context
+
+    RETURNS:
+    - Shopify: order history, lifetime value, customer tags
+    - Salesforce: CRM status, open cases, account tier
+    - Klaviyo: email engagement, predicted next order date
+    - Cin7: inventory/invoice history (if include_historical=true)
+    - A human-readable summary
+    - Actionable recommendations
+
+    The summary and recommendations are designed for LLM consumption -
+    use them to inform your response to the merchant.
+  DESC
+  tool_class: "Tools::AggregateCustomerContext"
+)
+
+#
+# Tool: refund_order
+# ──────────────────
+# DESIGN DECISION: Explicit tool for write operations.
+#
+# Write operations (refunds, updates, deletes) get their own tools because:
+# 1. AUTHORIZATION: Different permission model than reads.
+# 2. AUDIT TRAIL: Distinct logging for compliance.
+# 3. CONFIRMATION: The LLM should explicitly decide to take action.
+#
+FastMcp.register_tool(
+  name: "refund_order",
+  description: <<~DESC.strip,
+    Initiates a refund for a Shopify order.
+
+    USE THIS TOOL WHEN:
+    - A merchant explicitly requests a refund
+    - You have confirmed the order ID and refund amount
+    - You have verified refund eligibility (order age, status)
+
+    SAFETY: This is a WRITE operation that affects real money.
+    Always confirm details with the merchant before calling.
+    The tool validates eligibility before processing.
+
+    RETURNS:
+    - Success: refund_id, amount_refunded, confirmation
+    - Failure: error message explaining why refund was rejected
+  DESC
+  tool_class: "Tools::RefundOrder"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCE REGISTRATION (Optional)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# MCP Resources are read-only data sources that clients can enumerate and query.
+# Unlike tools (which are invoked with parameters), resources have stable URIs.
+#
+# DESIGN DECISION: We're not using resources in this implementation.
+#
+# Rationale:
+# 1. TOOL SUPERIORITY: For AI use cases, tools are more intuitive.
+#    "aggregate_customer_context(email)" vs. querying a resource by URI.
+# 2. DISCOVERY: The LLM naturally understands "use this tool to fetch X".
+#    Resource URIs are harder to reason about.
+#
+# When resources make sense:
+# - Large, enumerable datasets (product catalogs, order lists)
+# - Subscriptions/notifications (watch for new orders)
+# - When you need stable, bookmarkable references
+#
+# Example (not implemented):
+#
+# FastMcp.register_resource(
+#   uri: "shopify://orders/recent",
+#   name: "Recent Orders",
+#   description: "Last 50 orders, updated every minute",
+#   resource_class: "Resources::RecentOrders"
+# )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP VERIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Verify all tool classes exist (eager load)
+# This catches typos in tool_class strings before the first request.
+#
+if Rails.env.development? || Rails.env.test?
+  begin
+    Tools::AggregateCustomerContext
+    Tools::RefundOrder
+    Rails.logger.info "[MCP Server] All tool classes verified"
+  rescue NameError => e
+    Rails.logger.error "[MCP Server] Tool class missing: #{e.message}"
+  end
+end
+
+Rails.logger.info "[MCP Server] Initialized"

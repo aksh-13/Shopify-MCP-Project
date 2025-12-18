@@ -1,0 +1,45 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Rails
+rails-mcp-server/log/*
+rails-mcp-server/tmp/*
+rails-mcp-server/storage/*
+rails-mcp-server/public/uploads
+rails-mcp-server/db/*.sqlite3
+rails-mcp-server/db/*.sqlite3-*
+rails-mcp-server/.byebug_history
+rails-mcp-server/config/master.key
+rails-mcp-server/config/credentials/*.key
+
+# Remix / Node
+remix-mcp-client/node_modules/
+remix-mcp-client/.cache/
+remix-mcp-client/build/
+remix-mcp-client/public/build/
+remix-mcp-client/.env
+remix-mcp-client/app/styles/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# Misc
+.vercel
+.netlify

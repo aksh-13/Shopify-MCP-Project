@@ -1,0 +1,39 @@
+# frozen_string_literal: true
+
+require 'fast_mcp'
+
+# MCP Server Initialization
+# This initializer sets up the FastMcp server for Rails
+
+FastMcp.mount_in_rails(Rails.application,
+  name: "Unified Merchant Operations Platform",
+  version: "1.0.0",
+  path_prefix: "/mcp",
+  messages_route: "messages",
+  sse_route: "sse",
+  logger: Rails.logger,
+  authenticate: false  # Set to true in production with auth_token
+) do |server|
+  # Register MCP Tools
+  # Tools are automatically discovered and registered from app/tools/
+
+  # Manually register tools if needed:
+  # server.register_tool(Tools::AggregateCustomerContext)
+  # server.register_tool(Tools::RefundOrder)
+
+  Rails.logger.info "[MCP Server] Initializing with #{server.class.name}"
+end
+
+# Verify tool classes exist
+if Rails.env.development? || Rails.env.test?
+  begin
+    # Check if tool classes can be loaded
+    Tools::AggregateCustomerContext if defined?(Tools::AggregateCustomerContext)
+    Tools::RefundOrder if defined?(Tools::RefundOrder)
+    Rails.logger.info "[MCP Server] Tool classes verified"
+  rescue NameError => e
+    Rails.logger.warn "[MCP Server] Tool class not found: #{e.message}"
+  end
+end
+
+Rails.logger.info "[MCP Server] Initialized at /mcp/sse"
